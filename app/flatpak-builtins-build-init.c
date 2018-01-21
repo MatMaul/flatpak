@@ -32,6 +32,7 @@
 #include "flatpak-builtins.h"
 #include "flatpak-builtins-utils.h"
 #include "flatpak-utils.h"
+#include "flatpak-run.h"
 
 static char *opt_arch;
 static char *opt_var;
@@ -152,14 +153,19 @@ flatpak_builtin_build_init (int argc, char **argv, GCancellable *cancellable, GE
   g_autoptr(GString) metadata_contents = NULL;
   g_autoptr(GError) my_error = NULL;
   g_autoptr(FlatpakDeploy) sdk_deploy = NULL;
+  g_autoptr(FlatpakDeploy) app_deploy = NULL;
+  g_autoptr(GKeyFile) app_metakey = NULL;
   const char *app_id;
   const char *directory;
-  const char *sdk_pref;
+  const char *sdk_pref = NULL;
   const char *runtime_pref;
-  const char *default_branch = NULL;
+  const char *default_branch;
+  const char *sdk_branch = NULL;
   g_autofree char *runtime_ref = NULL;
   g_autofree char *var_ref = NULL;
   g_autofree char *sdk_ref = NULL;
+  g_autofree char *app_sdk_ref = NULL;
+  g_autofree char *app_name = NULL;
   FlatpakKinds kinds;
   int i;
   g_autoptr(FlatpakDir) sdk_dir = NULL;
@@ -168,7 +174,7 @@ flatpak_builtin_build_init (int argc, char **argv, GCancellable *cancellable, GE
   gboolean is_extension = FALSE;
   gboolean is_runtime = FALSE;
 
-  context = g_option_context_new (_("DIRECTORY APPNAME SDK RUNTIME [BRANCH] - Initialize a directory for building"));
+  context = g_option_context_new (_("DIRECTORY APPNAME SDK RUNTIME/APP [SDKBRANCH] [RUNTIMEBRANCH/APPBRANCH] - Initialize a directory for building"));
   g_option_context_set_translation_domain (context, GETTEXT_PACKAGE);
 
   if (!flatpak_option_context_parse (context, options, &argc, &argv, FLATPAK_BUILTIN_FLAG_NO_DIR, NULL, cancellable, error))
@@ -177,7 +183,7 @@ flatpak_builtin_build_init (int argc, char **argv, GCancellable *cancellable, GE
   if (argc < 5)
     return usage_error (context, _("RUNTIME must be specified"), error);
 
-  if (argc > 6)
+  if (argc > 7)
     return usage_error (context, _("Too many arguments"), error);
 
   directory = argv[1];
@@ -185,7 +191,11 @@ flatpak_builtin_build_init (int argc, char **argv, GCancellable *cancellable, GE
   sdk_pref = argv[3];
   runtime_pref = argv[4];
   if (argc >= 6)
-    default_branch = argv[5];
+    sdk_branch = argv[5];
+  if (argc >= 7)
+    default_branch = argv[6];
+  else
+    default_branch = sdk_branch;
 
   if (opt_type != NULL)
     {
@@ -205,7 +215,7 @@ flatpak_builtin_build_init (int argc, char **argv, GCancellable *cancellable, GE
     return flatpak_fail (error, _("'%s' is not a valid application name: %s"), app_id, my_error->message);
 
   kinds = FLATPAK_KINDS_RUNTIME;
-  sdk_dir = flatpak_find_installed_pref (sdk_pref, kinds, opt_arch, default_branch, TRUE, FALSE, FALSE, NULL,
+  sdk_dir = flatpak_find_installed_pref (sdk_pref, kinds, opt_arch, sdk_branch, TRUE, FALSE, FALSE, NULL,
                                          &sdk_ref, cancellable, error);
   if (sdk_dir == NULL)
     return FALSE;
@@ -218,6 +228,24 @@ flatpak_builtin_build_init (int argc, char **argv, GCancellable *cancellable, GE
                                              &runtime_ref, cancellable, error);
   if (runtime_dir == NULL)
     return FALSE;
+
+  if (g_str_has_prefix(runtime_ref, "app/"))
+    {
+      // app extension, check the specified SDK against to the app one
+      app_deploy = flatpak_dir_load_deployed (runtime_dir, runtime_ref, NULL, cancellable, error);
+      app_metakey = flatpak_deploy_get_metadata (app_deploy);
+      app_sdk_ref = g_key_file_get_string (app_metakey, FLATPAK_METADATA_GROUP_APPLICATION,
+                                        FLATPAK_METADATA_KEY_SDK,
+                                        NULL);
+      if (app_sdk_ref != NULL)
+        {
+          g_auto(GStrv) parts = g_strsplit (app_sdk_ref, "/", 0);
+          if (g_strv_length(parts) >= 1 && strcmp(parts[0], sdk_pref))
+            return flatpak_fail(error, _("Specified SDK doesn't match the app SDK"));
+          if (g_strv_length(parts) >= 3 && sdk_branch != NULL && strcmp(parts[2], sdk_branch))
+            return flatpak_fail(error, _("Specified SDK branch doesn't match the app SDK branch"));
+        }
+    }
 
   base = g_file_new_for_commandline_arg (directory);
 
@@ -264,7 +292,7 @@ flatpak_builtin_build_init (int argc, char **argv, GCancellable *cancellable, GE
     }
 
   if (opt_sdk_extensions &&
-      !ensure_extensions (sdk_deploy, default_branch,
+      !ensure_extensions (sdk_deploy, sdk_branch,
                           opt_sdk_extensions, usr_dir, cancellable, error))
     return FALSE;
 
